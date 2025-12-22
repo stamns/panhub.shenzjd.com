@@ -13,6 +13,7 @@ import { PluginManager, type AsyncSearchPlugin } from "../plugins/manager";
 const logger = createLogger("searchService");
 
 export interface SearchServiceOptions {
+  priorityChannels: string[];
   defaultChannels: string[];
   defaultConcurrency: number;
   pluginTimeoutMs: number;
@@ -33,6 +34,7 @@ export class SearchService {
       plugins: pluginManager.getPlugins().length,
       cacheEnabled: options.cacheEnabled,
       defaultConcurrency: options.defaultConcurrency,
+      priorityChannels: options.priorityChannels?.length || 0,
     });
   }
 
@@ -160,21 +162,29 @@ export class SearchService {
     concurrencyOverride?: number,
     ext?: Record<string, any>
   ): Promise<SearchResult[]> {
+    const startTime = Date.now();
     const chList = Array.isArray(channels) ? channels : [];
     const cacheKey = `tg:${keyword}:${[...chList].sort().join(",")}`;
-    const { cacheEnabled, cacheTtlMinutes } = this.options;
+    const { cacheEnabled, cacheTtlMinutes, priorityChannels } = this.options;
 
+    // 缓存检查
     if (!forceRefresh && cacheEnabled) {
       const cached = this.tgCache.get(cacheKey);
       if (cached.hit && cached.value) {
-        logger.debug("TG cache hit", { keyword, channels: chList.length });
+        const cacheTime = Date.now() - startTime;
+        logger.info("TG cache hit", {
+          keyword,
+          channels: chList.length,
+          results: cached.value.length,
+          timeMs: cacheTime
+        });
         return cached.value;
       }
     }
 
     logger.debug("TG search started", { keyword, channels: chList.length });
 
-    // 控制并发抓取频道公开页并解析（避免一次性打满连接被限流）
+    // 获取配置
     const { fetchTgChannelPosts } = await import("./tg");
     const perChannelLimit = 30;
     const requestedTimeout = Number((ext as any)?.__plugin_timeout_ms) || 0;
@@ -184,44 +194,133 @@ export class SearchService {
         ? requestedTimeout
         : this.options.pluginTimeoutMs || 0
     );
-
-    // 使用 safeExecute 包装每个频道的搜索，确保单个频道失败不影响整体
-    const runnerTasks = chList.map(
-      (ch) => async () =>
-        safeExecute(
-          () =>
-            this.withTimeout<SearchResult[]>(
-              fetchTgChannelPosts(ch, keyword, {
-                limitPerChannel: perChannelLimit,
-              }),
-              timeoutMs,
-              []
-            ),
-          [],
-          logger.child(`tg:${ch}`)
-        )
-    );
     const concurrency = Math.max(
       2,
       Math.min(concurrencyOverride ?? this.options.defaultConcurrency, 12)
     );
 
-    // 并行执行频道搜索
-    const resultsByChannel = await this.runWithConcurrency(
-      runnerTasks,
-      concurrency
-    );
-    const results: SearchResult[] = [];
-    for (const arr of resultsByChannel) {
-      if (Array.isArray(arr)) results.push(...(arr as SearchResult[]));
+    // 分批策略：优先频道 + 普通频道
+    const prioritySet = new Set(priorityChannels || []);
+    const priorityList = chList.filter((ch) => prioritySet.has(ch));
+    const normalList = chList.filter((ch) => !prioritySet.has(ch));
+
+    // 辅助函数：创建频道搜索任务（带性能监控）
+    const createChannelTask = (channel: string) => async () => {
+      const channelStart = Date.now();
+      const result = await safeExecute(
+        () =>
+          this.withTimeout<SearchResult[]>(
+            fetchTgChannelPosts(channel, keyword, {
+              limitPerChannel: perChannelLimit,
+            }),
+            timeoutMs,
+            []
+          ),
+        [],
+        logger.child(`tg:${channel}`)
+      );
+      const channelTime = Date.now() - channelStart;
+      logger.debug("TG channel completed", {
+        channel,
+        keyword,
+        results: result.length,
+        timeMs: channelTime,
+      });
+      return result;
+    };
+
+    // 性能监控
+    const metrics = {
+      priorityCount: priorityList.length,
+      normalCount: normalList.length,
+      priorityTime: 0,
+      normalTime: 0,
+      priorityResults: 0,
+      normalResults: 0,
+    };
+
+    // 第一批：优先频道（使用更高并发）
+    let results: SearchResult[] = [];
+    if (priorityList.length > 0) {
+      const priorityStart = Date.now();
+      logger.debug("TG search - priority batch", {
+        keyword,
+        priorityChannels: priorityList.length,
+        concurrency: Math.min(concurrency * 2, 12),
+      });
+
+      const priorityConcurrency = Math.min(concurrency * 2, 12); // 优先频道使用双倍并发
+      const priorityTasks = priorityList.map(createChannelTask);
+      const priorityResults = await this.runWithConcurrency(
+        priorityTasks,
+        priorityConcurrency
+      );
+
+      for (const arr of priorityResults) {
+        if (Array.isArray(arr)) {
+          results.push(...arr);
+          metrics.priorityResults += arr.length;
+        }
+      }
+      metrics.priorityTime = Date.now() - priorityStart;
+
+      logger.info("TG search - priority batch completed", {
+        keyword,
+        results: metrics.priorityResults,
+        timeMs: metrics.priorityTime,
+      });
     }
 
+    // 如果优先频道已有结果，继续抓取普通频道
+    if (normalList.length > 0) {
+      const normalStart = Date.now();
+      logger.debug("TG search - normal batch", {
+        keyword,
+        normalChannels: normalList.length,
+        concurrency,
+      });
+
+      const normalTasks = normalList.map(createChannelTask);
+      const normalResults = await this.runWithConcurrency(
+        normalTasks,
+        concurrency
+      );
+
+      for (const arr of normalResults) {
+        if (Array.isArray(arr)) {
+          results.push(...arr);
+          metrics.normalResults += arr.length;
+        }
+      }
+      metrics.normalTime = Date.now() - normalStart;
+
+      logger.info("TG search - normal batch completed", {
+        keyword,
+        results: metrics.normalResults,
+        timeMs: metrics.normalTime,
+      });
+    }
+
+    // 缓存结果
     if (cacheEnabled && results.length > 0) {
       this.tgCache.set(cacheKey, results, cacheTtlMinutes * 60_000);
       logger.debug("TG cache stored", { keyword, results: results.length });
     }
 
-    logger.debug("TG search completed", { keyword, results: results.length });
+    const totalTime = Date.now() - startTime;
+    logger.info("TG search completed", {
+      keyword,
+      totalResults: results.length,
+      totalTimeMs: totalTime,
+      priorityChannels: metrics.priorityCount,
+      normalChannels: metrics.normalCount,
+      priorityTimeMs: metrics.priorityTime,
+      normalTimeMs: metrics.normalTime,
+      priorityResults: metrics.priorityResults,
+      normalResults: metrics.normalResults,
+      cacheHit: false,
+    });
+
     return results;
   }
 
